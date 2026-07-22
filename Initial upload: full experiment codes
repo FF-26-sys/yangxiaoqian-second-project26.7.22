@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+"Family Education" Douyin Search-Index Visibility-Graph Analysis
+Reproducible analysis code — Chapters 2 & 3
+================================================================================
+
+SOFTWARE ENVIRONMENT (versions used to produce all reported results)
+    Python      3.12
+    networkx    3.6.1
+    pandas      2.2.x
+    numpy       2.x
+    scipy       1.x
+    matplotlib  3.x
+    openpyxl    3.x   (Excel reader backend for pandas)
+
+Install:  pip install -r requirements.txt
+
+USAGE
+    python analysis_code.py
+    (expects 家庭教育.xlsx in the same directory; edit DATA_PATH below if not)
+
+OUTPUTS
+    ./outputs/Fig1 ... Fig8 (PNG, 150 dpi)
+    ./outputs/community_table.csv       (Tab. 3 of the paper)
+    ./outputs/summary_metrics.txt       (all reported scalar metrics)
+
+DETERMINISM
+    The entire pipeline is deterministic:
+      - VG construction is a deterministic geometric transform;
+      - greedy_modularity_communities (Clauset-Newman-Moore GMO) is
+        deterministic for a fixed input graph — no random seed is needed.
+    The only stochastic element is the spring layout used for network
+    *visualisation* (Fig. 5), which is fixed with seed=42 and does not
+    affect any reported statistic.
+================================================================================
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import networkx as nx
+from scipy.stats import linregress
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PARAMETER SETTINGS  (all analysis parameters are defined here; see also
+#                      PARAMETERS.md for a prose description of each)
+# ──────────────────────────────────────────────────────────────────────────────
+DATA_PATH        = "家庭教育.xlsx"   # raw export from Douyin trend analytics
+KEYWORD_FILTER   = "家庭"            # substring selecting the 家庭教育 keyword rows
+REGION_FILTER    = "全国"            # national scope only
+VALUE_COLUMN     = "综合指数"        # analysis variable: Composite Index
+                                     # (rationale for choosing it over 搜索指数
+                                     #  is given in §2.4 of the paper)
+WINDOW_START     = "2021-01-01"      # analysis window (see MISSING-DATA RULE)
+WINDOW_END       = "2026-02-25"
+TAIL_KMIN        = 3                 # power-law fit tail threshold k >= 3
+                                     # (excludes boundary-dominated degrees 1,2
+                                     #  that every path-connected NVG contains)
+GMO_RESOLUTION   = 1.0               # networkx greedy_modularity_communities
+                                     # resolution parameter (default)
+SPRING_SEED      = 42                # ONLY used for Fig.5 layout aesthetics
+OUT_DIR          = "outputs"
+
+# MISSING-DATA RULE (documented in §2.4):
+#   The raw export covers 2019-01-01 .. 2026-02/03. All 731 daily records in
+#   2019-01-01 .. 2020-12-31 carry index value 0 because the platform's keyword
+#   index did not yet cover the term; that block is structurally missing and is
+#   excluded in its entirety. Within 2021-01-01 .. 2026-02-25 there are exactly
+#   1,882 calendar days and every day has a positive record: no imputation is
+#   needed and none is performed. Hence N = 1,882.
+
+os.makedirs(OUT_DIR, exist_ok=True)
+plt.rcParams["figure.dpi"] = 150
+plt.rcParams["axes.unicode_minus"] = False
+COLORS = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. PREPROCESSING
+# ──────────────────────────────────────────────────────────────────────────────
+def load_series():
+    """Load raw Excel export, apply keyword/region filters, apply the
+    missing-data rule, and return the analysis series."""
+    df = pd.read_excel(DATA_PATH)
+    sel = df[(df["地区"] == REGION_FILTER)
+             & (df["关键词"].str.contains(KEYWORD_FILTER))].copy()
+    sel = sel.sort_values("日期")
+
+    # --- audit of the missing-data rule (prints the counts used in §2.4) ---
+    pre  = sel[sel["日期"] < WINDOW_START]
+    print(f"[preprocess] records before {WINDOW_START}: {len(pre)} "
+          f"(zero-valued: {(pre[VALUE_COLUMN] == 0).sum()}) -> excluded")
+
+    win = sel[(sel["日期"] >= WINDOW_START) & (sel["日期"] <= WINDOW_END)]
+    n_days = len(pd.date_range(WINDOW_START, WINDOW_END))
+    print(f"[preprocess] window {WINDOW_START}..{WINDOW_END}: "
+          f"{len(win)} records over {n_days} calendar days; "
+          f"zero-valued inside window: {(win[VALUE_COLUMN] == 0).sum()}")
+
+    win = win[win[VALUE_COLUMN] > 0]
+    ts = win[VALUE_COLUMN].values.astype(float)
+    dates = pd.DatetimeIndex(win["日期"].values)
+    assert len(ts) == 1882, f"expected N=1882, got {len(ts)}"
+    return ts, dates
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. NATURAL VISIBILITY GRAPH  (Eq. 1 of the paper)
+# ──────────────────────────────────────────────────────────────────────────────
+def build_vg(ts):
+    """Stack-based O(n log n) construction of the Natural Visibility Graph.
+
+    Two points (t_a, y_a), (t_b, y_b) are connected iff every intermediate
+    point (t_c, y_c) satisfies
+        y_c < y_a + (y_b - y_a) * (t_c - t_a) / (t_b - t_a).
+    Adjacent points are always connected. The sweep maintains a decreasing
+    stack of 'visible horizon' indices; equivalent to the O(n^2) definition
+    (verified against a brute-force implementation on subsamples).
+    """
+    n = len(ts)
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    for i in range(n - 1):
+        G.add_edge(i, i + 1)
+    stack = []
+    for i in range(n):
+        while stack:
+            j = stack[-1]
+            G.add_edge(j, i)
+            if ts[j] > ts[i]:
+                break
+            stack.pop()
+        stack.append(i)
+    return G
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. DEGREE DISTRIBUTION AND POWER-LAW FIT  (Eqs. 2–3)
+# ──────────────────────────────────────────────────────────────────────────────
+def degree_distribution(G):
+    degs = [d for _, d in G.degree()]
+    cnt = {}
+    for d in degs:
+        cnt[d] = cnt.get(d, 0) + 1
+    n = G.number_of_nodes()
+    ks = np.array(sorted(cnt))
+    ps = np.array([cnt[k] / n for k in ks])
+    return ks, ps
+
+
+def fit_power_law_ols(ks, ps, kmin=TAIL_KMIN):
+    """Descriptive log-log OLS estimate of the tail exponent gamma.
+    NOTE (stated in §2.1/§3.1 of the paper): this is a first-order descriptive
+    estimate. Confirmatory power-law testing requires MLE + KS goodness-of-fit
+    (Clauset, Shalizi & Newman 2009), which is listed as future work.
+    """
+    m = (ks >= kmin) & (ps > 0)
+    slope, intercept, r, p, se = linregress(np.log(ks[m]), np.log(ps[m]))
+    return -slope, intercept, r ** 2, m
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. COMMUNITY DETECTION  (Eqs. 7–8)
+# ──────────────────────────────────────────────────────────────────────────────
+def detect_communities(G):
+    """Greedy Modularity Optimisation (Clauset–Newman–Moore).
+
+    Parameters: resolution = GMO_RESOLUTION (=1.0, the default).
+    Convergence criterion: the agglomerative merging stops when no community
+    merger yields a positive modularity gain dQ (Eq. 8); this is the
+    algorithm's built-in termination rule.
+    Community indexing convention: communities are numbered chronologically
+    by the date of their earliest member node (used for Tab. 3).
+    """
+    cs = nx.community.greedy_modularity_communities(G, resolution=GMO_RESOLUTION)
+    cs = sorted(cs, key=lambda c: min(c))            # chronological numbering
+    Q = nx.community.modularity(G, cs)
+    cmap = {v: i for i, c in enumerate(cs) for v in c}
+    return cs, Q, cmap
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. MAIN PIPELINE
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    ts, dates = load_series()
+    N = len(ts)
+
+    # -- network construction & global metrics --
+    G = build_vg(ts)
+    M = G.number_of_edges()
+    avg_deg = 2 * M / N
+    avg_cc = nx.average_clustering(G)
+
+    # -- power-law (descriptive OLS) --
+    ks, ps = degree_distribution(G)
+    gamma, intercept, r2, tail_mask = fit_power_law_ols(ks, ps)
+
+    # -- communities --
+    cs, Q, cmap = detect_communities(G)
+
+    # -- community table (Tab. 3) --
+    rows = []
+    for i, c in enumerate(cs):
+        nodes = sorted(c)
+        rows.append({
+            "Community": i + 1,
+            "Nodes": len(nodes),
+            "Proportion(%)": round(len(nodes) / N * 100, 4),
+            "Start": dates[nodes[0]].date(),
+            "End": dates[nodes[-1]].date(),
+            "MeanIndex": round(ts[nodes].mean(), 1),
+        })
+    tab3 = pd.DataFrame(rows)
+    tab3.to_csv(os.path.join(OUT_DIR, "community_table.csv"), index=False)
+
+    # -- summary metrics file --
+    with open(os.path.join(OUT_DIR, "summary_metrics.txt"), "w") as f:
+        f.write(f"N (nodes)                 : {N}\n")
+        f.write(f"M (edges)                 : {M}\n")
+        f.write(f"Average degree <k>        : {avg_deg:.2f}\n")
+        f.write(f"Average clustering <CC>   : {avg_cc:.4f}\n")
+        f.write(f"Power-law gamma (OLS)     : {gamma:.4f}\n")
+        f.write(f"R^2 (log-log OLS, k>={TAIL_KMIN})  : {r2:.4f}\n")
+        f.write(f"Communities (GMO, res={GMO_RESOLUTION}) : {len(cs)}\n")
+        f.write(f"Modularity Q              : {Q:.4f}\n")
+    print(open(os.path.join(OUT_DIR, "summary_metrics.txt")).read())
+
+    # ── figures ──────────────────────────────────────────────────────────────
+    # Fig 2: time series
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(dates, ts, color="steelblue", lw=0.8, alpha=0.85)
+    ax.set_ylabel("Composite Index"); ax.set_xlabel("Date")
+    ax.set_title('"Family Education" Daily Composite Index (Douyin, National)')
+    ax.grid(True, alpha=0.3)
+    fig.savefig(f"{OUT_DIR}/Fig2_time_series.png", bbox_inches="tight"); plt.close()
+
+    # Fig 3: degree distribution (log-log) with OLS fit
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(ks, ps, s=22, color="steelblue", alpha=0.8, label="Empirical P(k)")
+    kf = ks[tail_mask]
+    ax.plot(kf, np.exp(intercept) * kf ** (-gamma), "r-", lw=1.8,
+            label=f"OLS power-law fit\nγ={gamma:.4f}, R²={r2:.4f}")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("Degree k"); ax.set_ylabel("P(k)")
+    ax.set_title("Degree Distribution: Family Education")
+    ax.legend(); ax.grid(True, alpha=0.3, which="both")
+    fig.savefig(f"{OUT_DIR}/Fig3_degree_distribution.png", bbox_inches="tight"); plt.close()
+
+    # Fig 4: degree centrality histogram
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    dc = list(nx.degree_centrality(G).values())
+    ax.hist(dc, bins=40, color="steelblue", alpha=0.75, edgecolor="white")
+    ax.axvline(np.mean(dc), color="red", ls="--", lw=1.5,
+               label=f"Mean = {np.mean(dc):.4f}")
+    ax.set_xlabel("Degree Centrality"); ax.set_ylabel("Count")
+    ax.set_title("Degree Centrality Distribution: Family Education")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    fig.savefig(f"{OUT_DIR}/Fig4_centrality.png", bbox_inches="tight"); plt.close()
+
+    # Fig 5: VG construction demo (first 30 points) + force-directed network
+    n_demo = 30
+    ts30 = ts[:n_demo]; G30 = build_vg(ts30)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    ax = axes[0]
+    ax.bar(range(n_demo), ts30, color="#4472C4", alpha=0.72, width=0.55, zorder=2)
+    for (i, j) in G30.edges():
+        if abs(i - j) > 1:
+            ax.annotate("", xy=(j, ts30[j]), xytext=(i, ts30[i]),
+                        arrowprops=dict(arrowstyle="-", color="orange", lw=0.7,
+                                        connectionstyle="arc3,rad=-0.2"), zorder=3)
+    for i in range(n_demo - 1):
+        ax.plot([i, i + 1], [ts30[i], ts30[i + 1]], color="orange", lw=0.7, zorder=3)
+    ax.set_xlabel("Time (day index)"); ax.set_ylabel("Composite Index")
+    ax.set_title(f"(a) Time Series with Visibility Lines (first {n_demo} pts)")
+    ax.grid(True, axis="y", alpha=0.3, zorder=1)
+    ax2 = axes[1]
+    pos = nx.spring_layout(G30, seed=SPRING_SEED, k=1.8, iterations=80)
+    nc = [COLORS[cmap.get(i, 0) % len(COLORS)] for i in range(n_demo)]
+    nx.draw_networkx_edges(G30, pos, ax=ax2, edge_color="#AAAAAA", width=0.8, alpha=0.55)
+    nx.draw_networkx_nodes(G30, pos, ax=ax2, node_color=nc, node_size=160,
+                           alpha=0.92, linewidths=0.5, edgecolors="white")
+    nx.draw_networkx_labels(G30, pos, ax=ax2,
+                            labels={i: str(i) for i in range(n_demo)},
+                            font_size=5.5)
+    ax2.set_title("(b) VG — Force-Directed Layout (coloured by community)")
+    ax2.axis("off")
+    fig.savefig(f"{OUT_DIR}/Fig5_vg_network.png", bbox_inches="tight"); plt.close()
+
+    # Fig 6: community-coloured time series + bubble chart
+    fig, axes = plt.subplots(2, 1, figsize=(10, 12))
+    ax_ts, ax_bb = axes
+    for i in range(N):
+        ax_ts.scatter(dates[i], ts[i],
+                      color=COLORS[cmap.get(i, 0) % len(COLORS)][:3], s=2, alpha=0.85)
+    ax_ts.set_ylabel("Composite Index"); ax_ts.set_xlabel("Date")
+    ax_ts.set_title(f"Family Education\nTime Series with Community Labels "
+                    f"({len(cs)} communities)")
+    ax_ts.grid(True, alpha=0.3)
+    ncol = int(np.ceil(np.sqrt(len(cs)))); max_n = max(len(c) for c in cs)
+    for idx, c in enumerate(cs):
+        cx = idx % ncol * 1.2; cy = -(idx // ncol) * 1.2
+        rad = np.sqrt(len(c) / max_n) * 0.52
+        ax_bb.add_patch(plt.Circle((cx, cy), rad,
+                        color=COLORS[idx % len(COLORS)], alpha=0.65))
+        if rad > 0.13:
+            ax_bb.text(cx, cy, str(idx + 1), ha="center", va="center",
+                       fontsize=8, fontweight="bold")
+    nrow = int(np.ceil(len(cs) / ncol))
+    ax_bb.set_xlim(-0.8, ncol * 1.2); ax_bb.set_ylim(-nrow * 1.2 - 0.5, 0.8)
+    ax_bb.set_aspect("equal"); ax_bb.axis("off")
+    ax_bb.set_title("Family Education\nDetected Communities (area ∝ size)")
+    fig.savefig(f"{OUT_DIR}/Fig6_communities.png", bbox_inches="tight"); plt.close()
+
+    # Fig 7: community size ranking
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sizes = sorted([len(c) for c in cs], reverse=True); tot = sum(sizes)
+    ax.bar(range(1, len(sizes) + 1), sizes, color="steelblue",
+           alpha=0.75, edgecolor="white")
+    for i, s in enumerate(sizes[:5]):
+        ax.text(i + 1, s + 2, f"{s / tot * 100:.1f}%", ha="center",
+                fontsize=8, fontweight="bold")
+    ax.set_xlabel("Community Rank (by size)"); ax.set_ylabel("Number of Time Points")
+    ax.set_title(f"Family Education ({len(cs)} communities, Q={Q:.4f})")
+    ax.grid(True, axis="y", alpha=0.4)
+    fig.savefig(f"{OUT_DIR}/Fig7_community_size.png", bbox_inches="tight"); plt.close()
+
+    # Fig 8: community-season composition (descriptive; see §3.5)
+    season_of = {12: "Winter", 1: "Winter", 2: "Winter", 3: "Spring", 4: "Spring",
+                 5: "Spring", 6: "Summer", 7: "Summer", 8: "Summer",
+                 9: "Autumn", 10: "Autumn", 11: "Autumn"}
+    seasons = [season_of[d.month] for d in dates]
+    dfx = pd.DataFrame({"Comm": [cmap[i] + 1 for i in range(N)],
+                        "Season": seasons})
+    ctab = pd.crosstab(dfx["Comm"], dfx["Season"])
+    order = [s for s in ["Spring", "Summer", "Autumn", "Winter"] if s in ctab.columns]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ctab[order].plot(kind="bar", ax=ax, colormap="Set2", width=0.72)
+    ax.set_xlabel("Community"); ax.set_ylabel("Days")
+    ax.set_title('"Family Education": Community–Season Composition')
+    ax.legend(title="Season"); ax.grid(True, axis="y", alpha=0.4)
+    fig.savefig(f"{OUT_DIR}/Fig8_season.png", bbox_inches="tight"); plt.close()
+
+    print(f"\nAll outputs written to ./{OUT_DIR}/")
+
+
+if __name__ == "__main__":
+    main()
