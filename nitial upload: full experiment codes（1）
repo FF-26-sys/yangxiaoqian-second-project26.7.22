@@ -1,0 +1,311 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from scipy.stats import linregress
+import warnings, os
+warnings.filterwarnings('ignore')
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['figure.dpi'] = 150
+
+OUTDIR = '/mnt/user-data/outputs/'
+os.makedirs(OUTDIR, exist_ok=True)
+
+# ─── 1. Load data ────────────────────────────────────────────
+df = pd.read_excel('/mnt/user-data/uploads/家庭教育.xlsx')
+def get_series(kw_str):
+    s = df[(df['地区']=='全国') & (df['关键词'].str.contains(kw_str)) & (df['综合指数']>0)].copy()
+    return s.sort_values('日期').set_index('日期')
+
+jj_raw = get_series('家庭')
+ai_raw = get_series('人工')
+common  = sorted(set(jj_raw.index) & set(ai_raw.index))
+jj = jj_raw.loc[common]['综合指数'].values.astype(float)
+ai = ai_raw.loc[common]['综合指数'].values.astype(float)
+dates = pd.DatetimeIndex(common)
+N = len(jj)
+print(f"N={N}, {dates[0].date()} – {dates[-1].date()}")
+
+COLORS = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors)
+
+# ─── 2. Visibility Graph ──────────────────────────────────────
+def build_vg(ts):
+    n = len(ts)
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    for i in range(n-1):
+        G.add_edge(i, i+1)
+    stk = []
+    for i in range(n):
+        while stk:
+            j = stk[-1]
+            G.add_edge(j, i)
+            if ts[j] > ts[i]: break
+            stk.pop()
+        stk.append(i)
+    return G
+
+G_jj = build_vg(jj); print("VG jj:", G_jj.number_of_nodes(), G_jj.number_of_edges())
+G_ai = build_vg(ai); print("VG ai:", G_ai.number_of_nodes(), G_ai.number_of_edges())
+
+# ─── 3. Degree distribution + power-law ──────────────────────
+def deg_dist(G):
+    degs = [d for _,d in G.degree()]
+    cnt = {}
+    for d in degs: cnt[d] = cnt.get(d,0)+1
+    n = G.number_of_nodes()
+    ks = np.array(sorted(cnt)); ps = np.array([cnt[k]/n for k in ks])
+    return ks, ps
+
+def fit_pl(ks, ps, kmin=3):
+    m = (ks>=kmin) & (ps>0)
+    sl, ic, r, *_ = linregress(np.log(ks[m]), np.log(ps[m]))
+    return -sl, ic, r**2, m
+
+k_jj,p_jj = deg_dist(G_jj); γ_jj,ic_jj,r2_jj,m_jj = fit_pl(k_jj,p_jj)
+k_ai,p_ai = deg_dist(G_ai); γ_ai,ic_ai,r2_ai,m_ai = fit_pl(k_ai,p_ai)
+print(f"γ_jj={γ_jj:.5f} R²={r2_jj:.4f}  γ_ai={γ_ai:.5f} R²={r2_ai:.4f}")
+
+# ─── 4. Community detection ──────────────────────────────────
+def detect(G):
+    cs = sorted(nx.community.greedy_modularity_communities(G), key=lambda c: min(c))
+    Q  = nx.community.modularity(G, cs)
+    cmap = {}
+    for i,c in enumerate(cs):
+        for v in c: cmap[v]=i
+    return cs, Q, cmap
+
+cs_jj, Q_jj, cm_jj = detect(G_jj)
+cs_ai, Q_ai, cm_ai = detect(G_ai)
+print(f"Communities jj={len(cs_jj)} Q={Q_jj:.4f}  ai={len(cs_ai)} Q={Q_ai:.4f}")
+
+# avg clustering
+cc_jj = nx.average_clustering(G_jj)
+cc_ai = nx.average_clustering(G_ai)
+print(f"Avg clustering jj={cc_jj:.4f} ai={cc_ai:.4f}")
+
+# ─── 5. Community stats tables ───────────────────────────────
+def comm_table(cs, ts, dates, label):
+    rows=[]
+    for i,c in enumerate(cs):
+        ns=sorted(c); n=len(ns)
+        rows.append(dict(Comm=i+1, Nodes=n,
+                         Pct=f"{n/len(ts)*100:.4f}%",
+                         Start=str(dates[ns[0]].date()),
+                         End=str(dates[ns[-1]].date()),
+                         Mean=round(ts[ns].mean(),1)))
+    df2=pd.DataFrame(rows)
+    print(f"\n{label}:"); print(df2.to_string(index=False))
+    return df2
+
+st_jj = comm_table(cs_jj, jj, dates, "家庭教育")
+st_ai = comm_table(cs_ai, ai, dates, "人工智能")
+
+# ════════════════════════════════════════════════════
+# FIGURES
+# ════════════════════════════════════════════════════
+
+# ── Fig1: Time series ────────────────────────────────
+fig,axes=plt.subplots(2,1,figsize=(14,6),sharex=False)
+axes[0].plot(dates,jj,color='steelblue',lw=0.8,alpha=0.85)
+axes[0].set_ylabel('Composite Index',fontsize=11)
+axes[0].set_title('(a) "Family Education" Daily Search Index (Douyin, National, 2021–2026)',fontsize=11)
+axes[0].grid(True,alpha=0.3)
+axes[1].plot(dates,ai,color='darkorange',lw=0.8,alpha=0.85)
+axes[1].set_ylabel('Composite Index',fontsize=11)
+axes[1].set_title('(b) "Artificial Intelligence" Daily Search Index (Douyin, National, 2021–2026)',fontsize=11)
+axes[1].grid(True,alpha=0.3)
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig1_time_series.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig1")
+
+# ── Fig2: VG schematic (10 pts, like paper) ──────────
+ts10=jj[:10]; G10=build_vg(ts10)
+fig,axes=plt.subplots(1,2,figsize=(13,5))
+ax=axes[0]
+ax.bar(range(10),ts10,color='#4472C4',alpha=0.75,width=0.5,zorder=2)
+for (i,j2) in G10.edges():
+    if abs(i-j2)>1:
+        ax.annotate('',xy=(j2,ts10[j2]),xytext=(i,ts10[i]),
+                    arrowprops=dict(arrowstyle='-',color='orange',lw=1.0,
+                                   connectionstyle='arc3,rad=-0.25'),zorder=3)
+for i in range(9):
+    ax.plot([i,i+1],[ts10[i],ts10[i+1]],color='orange',lw=1.0,zorder=3)
+ax.set_xlabel('Time',fontsize=11); ax.set_ylabel('Index Value',fontsize=11)
+ax.set_title('(a) Time Series with Visibility Lines',fontsize=10); ax.grid(True,axis='y',alpha=0.3)
+
+ax2=axes[1]
+pos=nx.spring_layout(G10,seed=1,k=2.0)
+nx.draw_networkx_edges(G10,pos,ax=ax2,alpha=0.5,edge_color='gray',width=1.2,
+                       connectionstyle='arc3,rad=0.15')
+nx.draw_networkx_nodes(G10,pos,ax=ax2,node_color='#4472C4',node_size=350,alpha=0.9)
+nx.draw_networkx_labels(G10,pos,ax=ax2,font_size=9,font_color='white',font_weight='bold')
+ax2.set_title('(b) Corresponding Visibility Graph',fontsize=10); ax2.axis('off')
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig2_vg_example.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig2")
+
+# ── Fig3: Degree distribution log-log ───────────────
+fig,axes=plt.subplots(1,2,figsize=(12,5))
+for ax,(ks,ps,γ,ic,r2,m,label,col) in zip(axes,[
+        (k_jj,p_jj,γ_jj,ic_jj,r2_jj,m_jj,'Family Education','steelblue'),
+        (k_ai,p_ai,γ_ai,ic_ai,r2_ai,m_ai,'Artificial Intelligence','darkorange')]):
+    ax.scatter(ks,ps,s=20,color=col,alpha=0.8,label='Empirical P(k)')
+    kf=ks[m]; pf=np.exp(ic)*kf**(-γ)
+    ax.plot(kf,pf,'r-',lw=1.8,label=f'Power-law: γ={γ:.4f}\nR²={r2:.4f}')
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlabel('Degree k',fontsize=11); ax.set_ylabel('P(k)',fontsize=11)
+    ax.set_title(f'Degree Distribution: {label}',fontsize=11)
+    ax.legend(fontsize=9); ax.grid(True,alpha=0.3,which='both')
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig3_degree_distribution.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig3")
+
+# ── Fig4: Community detection (time series + bubbles) ─
+fig,axes=plt.subplots(2,2,figsize=(16,10))
+for row_ax,(ts,cs,cm,label,st_df) in zip(axes,[
+        (jj,cs_jj,cm_jj,'Family Education',st_jj),
+        (ai,cs_ai,cm_ai,'Artificial Intelligence',st_ai)]):
+    ax_ts,ax_bb=row_ax
+    # scatter colored by community
+    c_arr=np.array([COLORS[cm.get(i,0)%len(COLORS)][:3] for i in range(len(ts))])
+    for i in range(len(ts)):
+        ax_ts.scatter(dates[i],ts[i],color=c_arr[i],s=2,alpha=0.85)
+    ax_ts.set_ylabel('Composite Index',fontsize=10)
+    ax_ts.set_title(f'{label}\nTime Series with Community Labels ({len(cs)} communities)',fontsize=10)
+    ax_ts.set_xlabel('Date'); ax_ts.grid(True,alpha=0.3)
+    # bubble chart
+    nc=len(cs); ncol=int(np.ceil(np.sqrt(nc))); nrow=int(np.ceil(nc/ncol))
+    max_n=max(len(c) for c in cs)
+    for idx,c in enumerate(cs):
+        cx=idx%ncol*1.2; cy=-(idx//ncol)*1.2
+        r=np.sqrt(len(c)/max_n)*0.52
+        circle=plt.Circle((cx,cy),r,color=COLORS[idx%len(COLORS)],alpha=0.65)
+        ax_bb.add_patch(circle)
+        if r>0.13: ax_bb.text(cx,cy,str(idx+1),ha='center',va='center',fontsize=7,fontweight='bold')
+    ax_bb.set_xlim(-0.8,ncol*1.2); ax_bb.set_ylim(-nrow*1.2-0.5,0.8)
+    ax_bb.set_aspect('equal'); ax_bb.axis('off')
+    ax_bb.set_title(f'{label}\nDetected Communities (area ∝ size)',fontsize=10)
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig4_community_detection.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig4")
+
+# ── Fig5 & Fig6: VG network — force-directed, 30 pts ──
+# This is the KEY fix: spring_layout shows community clustering visually
+def plot_vg_network(ts_full, cs_full, cm_full, title, fname, n=30):
+    ts=ts_full[:n]
+    G_s=build_vg(ts)
+    # community color for each node 0..n-1
+    nc=[COLORS[cm_full.get(i,0)%len(COLORS)] for i in range(n)]
+    
+    fig,axes=plt.subplots(1,2,figsize=(14,6))
+    fig.suptitle(title, fontsize=11, fontweight='bold')
+    
+    # Left: bar + orange visibility arcs
+    ax=axes[0]
+    ax.bar(range(n),ts,color='#4472C4',alpha=0.72,width=0.55,zorder=2)
+    for (i,j2) in G_s.edges():
+        if abs(i-j2)>1:
+            ax.annotate('',xy=(j2,ts[j2]),xytext=(i,ts[i]),
+                        arrowprops=dict(arrowstyle='-',color='orange',lw=0.7,
+                                       connectionstyle='arc3,rad=-0.2'),zorder=3)
+    for i in range(n-1):
+        ax.plot([i,i+1],[ts[i],ts[i+1]],color='orange',lw=0.7,zorder=3)
+    ax.set_xlabel('Time (day index)',fontsize=10)
+    ax.set_ylabel('Composite Index',fontsize=10)
+    ax.set_title(f'(a) Time Series with Visibility Lines\n(first {n} time points)',fontsize=10)
+    ax.grid(True,axis='y',alpha=0.3,zorder=1)
+    
+    # Right: FORCE-DIRECTED layout — communities cluster visually
+    ax2=axes[1]
+    pos=nx.spring_layout(G_s, seed=42, k=1.8, iterations=80)
+    # edge weights: thicker = shorter temporal distance
+    widths=[max(0.2, 1.5-0.05*abs(u-v)) for u,v in G_s.edges()]
+    nx.draw_networkx_edges(G_s,pos,ax=ax2,edge_color='#AAAAAA',
+                           width=widths,alpha=0.55)
+    nx.draw_networkx_nodes(G_s,pos,ax=ax2,
+                           node_color=nc,node_size=160,alpha=0.92,
+                           linewidths=0.5,edgecolors='white')
+    nx.draw_networkx_labels(G_s,pos,ax=ax2,
+                            labels={i:str(i) for i in range(n)},
+                            font_size=5.5,font_color='black')
+    ax2.set_title(f'(b) Visibility Graph — Force-Directed Layout\n(nodes coloured by community)',fontsize=10)
+    ax2.axis('off')
+    # legend: unique communities appearing in first n nodes
+    seen={}
+    for i in range(n):
+        ci=cm_full.get(i,0)
+        if ci not in seen: seen[ci]=i
+    patches=[mpatches.Patch(color=COLORS[ci%len(COLORS)],label=f'Comm {ci+1}')
+             for ci in sorted(seen.keys())]
+    ax2.legend(handles=patches,loc='lower right',fontsize=7,
+               title='Community',title_fontsize=7,ncol=2,framealpha=0.85)
+    
+    plt.tight_layout()
+    fig.savefig(fname,dpi=150,bbox_inches='tight')
+    plt.close(); print(f"Saved {fname}")
+
+plot_vg_network(jj,cs_jj,cm_jj,
+    '"Family Education" – VG Construction & Network (first 30 time points)',
+    OUTDIR+'Fig5_network_jj.png', n=30)
+plot_vg_network(ai,cs_ai,cm_ai,
+    '"Artificial Intelligence" – VG Construction & Network (first 30 time points)',
+    OUTDIR+'Fig6_network_ai.png', n=30)
+
+# ── Fig7: Community size bar chart ───────────────────
+fig,axes=plt.subplots(1,2,figsize=(14,5))
+for ax,(cs,label,col) in zip(axes,[
+        (cs_jj,'Family Education','steelblue'),
+        (cs_ai,'Artificial Intelligence','darkorange')]):
+    sizes=sorted([len(c) for c in cs],reverse=True)
+    tot=sum(sizes)
+    bars=ax.bar(range(1,len(sizes)+1),sizes,color=col,alpha=0.75,edgecolor='white')
+    for i,s in enumerate(sizes[:5]):
+        ax.text(i+1,s+2,f'{s/tot*100:.1f}%',ha='center',fontsize=7.5,fontweight='bold')
+    ax.set_xlabel('Community Rank (by size)',fontsize=11)
+    ax.set_ylabel('Number of Time Points',fontsize=11)
+    ax.set_title(f'{label}\n({len(cs)} communities, Q={Q_jj if label=="Family Education" else Q_ai:.4f})',fontsize=11)
+    ax.grid(True,axis='y',alpha=0.4)
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig7_community_size.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig7")
+
+# ── Fig8: Season composition ─────────────────────────
+def get_season(m):
+    return {12:'Winter',1:'Winter',2:'Winter',3:'Spring',4:'Spring',5:'Spring',
+            6:'Summer',7:'Summer',8:'Summer',9:'Autumn',10:'Autumn',11:'Autumn'}[m]
+seasons=np.array([get_season(d.month) for d in dates])
+node_comm=np.array([cm_jj[i] for i in range(N)])
+df_s=pd.DataFrame({'Comm':node_comm+1,'Season':seasons,'Index':jj})
+ctab=pd.crosstab(df_s['Comm'],df_s['Season'])
+fig,ax=plt.subplots(figsize=(12,5))
+so=['Spring','Summer','Autumn','Winter']
+ctab[[s for s in so if s in ctab.columns]].plot(kind='bar',ax=ax,colormap='Set2',width=0.72)
+ax.set_xlabel('Community',fontsize=11); ax.set_ylabel('Days',fontsize=11)
+ax.set_title('"Family Education": Community–Season Composition',fontsize=11)
+ax.legend(title='Season',fontsize=9); ax.grid(True,axis='y',alpha=0.4)
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig8_season.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig8")
+
+# ── Fig9: Degree centrality histogram ────────────────
+fig,axes=plt.subplots(1,2,figsize=(12,4.5))
+for ax,(G,label,col) in zip(axes,[
+        (G_jj,'Family Education','steelblue'),
+        (G_ai,'Artificial Intelligence','darkorange')]):
+    dc=list(nx.degree_centrality(G).values())
+    ax.hist(dc,bins=40,color=col,alpha=0.75,edgecolor='white')
+    ax.axvline(np.mean(dc),color='red',ls='--',lw=1.5,label=f'Mean={np.mean(dc):.4f}')
+    ax.set_xlabel('Degree Centrality',fontsize=11); ax.set_ylabel('Count',fontsize=11)
+    ax.set_title(f'Degree Centrality Distribution: {label}',fontsize=11)
+    ax.legend(fontsize=9); ax.grid(True,alpha=0.3)
+plt.tight_layout()
+fig.savefig(OUTDIR+'Fig9_centrality.png',dpi=150,bbox_inches='tight')
+plt.close(); print("Saved Fig9")
+
+print("\n=== ALL DONE ===")
+print(f"Summary jj: N={G_jj.number_of_nodes()} M={G_jj.number_of_edges()} γ={γ_jj:.5f} R²={r2_jj:.4f} comms={len(cs_jj)} Q={Q_jj:.4f} CC={cc_jj:.4f}")
+print(f"Summary ai: N={G_ai.number_of_nodes()} M={G_ai.number_of_edges()} γ={γ_ai:.5f} R²={r2_ai:.4f} comms={len(cs_ai)} Q={Q_ai:.4f} CC={cc_ai:.4f}")
